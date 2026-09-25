@@ -1,0 +1,1261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Impression, Adrift</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #1a1712;
+    background-image: radial-gradient(ellipse at 50% 30%, #24201a 0%, #14120e 70%, #0b0a08 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: Georgia, 'Iowan Old Style', serif;
+    overflow: hidden;
+  }
+  #frame {
+    background: linear-gradient(180deg, #ece5d5 0%, #ddd3ba 100%);
+    padding: 30px 30px 20px 30px;
+    box-shadow:
+      0 30px 60px rgba(0,0,0,0.55),
+      0 8px 20px rgba(0,0,0,0.4),
+      inset 0 0 0 1px rgba(0,0,0,0.06);
+    border-radius: 2px;
+  }
+  #canvasWrap {
+    position: relative;
+    cursor: crosshair;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.3), 0 2px 6px rgba(0,0,0,0.45);
+  }
+  canvas { display: block; }
+  #caption {
+    margin-top: 14px;
+    text-align: center;
+    color: #4a4436;
+  }
+  #caption .title {
+    font-size: 15px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+  #caption .sub {
+    font-size: 11px;
+    letter-spacing: 0.3px;
+    color: #8c8368;
+    margin-top: 5px;
+    font-family: -apple-system, sans-serif;
+  }
+  #ctrlRow { display: flex; justify-content: center; }
+</style>
+</head>
+<body>
+<div id="frame">
+  <div id="canvasWrap"></div>
+  <div id="caption">
+    <div class="sub">hover to sail the boat toward you, closer as you look down &middot; sail near the island to pick up or drop off its passenger &middot; click and hold to raise a storm</div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script>
+/*
+  Interactive impressionist seascape, v2.
+
+  Fix from v1: the base painting used to be scattered brush dabs on a
+  TRANSPARENT layer, which left visible gaps between dabs -> read as
+  white static speckle. Now the layer is fully opaque from the start
+  (a real multi-stop canvas gradient for sky and water) and brush dabs
+  are layered ON TOP purely for texture, so there is never a gap to
+  show through.
+
+  Also fixed: the sky color path used to interpolate hue numerically
+  from orange to violet, which sweeps straight through green on the
+  color wheel. Colors are now defined as explicit RGB stops (indigo ->
+  violet -> magenta -> coral -> gold) so the path never touches green.
+*/
+
+let W = 880, H = 520, HORIZON;
+let paintLayer, reflectionGlow;
+let sunX, sunY;
+
+let stormLevel = 0, stormTarget = 0;
+let lightningFlash = 0;
+let lightningBolt = null;
+let raindrops = [];
+let clouds = [];
+let boatX, boatTargetX, boatY, boatTargetY, boatScale = 0.7, boatTiltVel = 0;
+let islandX, islandY, humanOnBoat = false, nearIslandPrev = false;
+let rockFacets = [], rockCracks = [];
+let sandGrain = [];
+let boatHullDabs = [], boatSailDabs = [];
+let palmFrondData = {};
+let boatReflectionJitter = [];
+let swellFoamRows = [];
+let swellRowParams = [];
+let turbPatches = [];
+let waveRowDabs = [];
+let waveSamplePoints = [];
+const SWELL_ROWS_INIT = 8;
+
+// the shared big-swell-envelope height used by the fill, the boat
+// sync, AND the dab slope orientation -- having three separate copies
+// of similar-but-not-identical formulas was exactly how the boat
+// desynced from the waves earlier; this is the single source of truth
+function bigSwellHeight(x, speed, amp, row) {
+  const bigFreq = (row.bigCycles * TWO_PI) / W;
+  const bigSpeed = speed * row.bigSpeedMul;
+  const upness = sin(x * bigFreq + row.bigPhase + bigSpeed);
+  return -upness * amp * 0.95;
+}
+
+const skyStops = [
+  { t: 0.00, c: [34, 30, 72] },
+  { t: 0.22, c: [64, 48, 108] },
+  { t: 0.42, c: [140, 78, 132] },
+  { t: 0.62, c: [212, 112, 104] },
+  { t: 0.80, c: [247, 172, 96] },
+  { t: 1.00, c: [255, 226, 168] }
+];
+const waterStops = [
+  { t: 0.00, c: [214, 168, 118] },
+  { t: 0.05, c: [128, 132, 138] },
+  { t: 0.22, c: [58, 92, 118] },
+  { t: 0.45, c: [32, 62, 90] },
+  { t: 0.72, c: [17, 40, 64] },
+  { t: 1.00, c: [7, 18, 32] }
+];
+
+function setup() {
+  HORIZON = H * 0.55;
+  sunX = W * 0.56; sunY = HORIZON - 6;
+  const c = createCanvas(W, H);
+  c.parent('canvasWrap');
+  pixelDensity(1);
+  paintLayer = createGraphics(W, H);
+  paintLayer.noStroke();
+
+  islandX = W * 0.74;
+  islandY = HORIZON - 2;
+
+  generateBasePainting();
+  window.resetPainting = generateBasePainting;
+
+  boatX = W * 0.4;
+  boatTargetX = boatX;
+  boatY = HORIZON - 3;
+  boatTargetY = boatY;
+
+  // island rock texture, generated once so it's stable instead of
+  // flickering like static if re-randomized every frame
+  for (let i = 0; i < 55; i++) {
+    const lighter = random() < 0.4;
+    rockFacets.push({
+      x: random(-32, 26), y: random(-62, -3),
+      w: random(6, 26), h: random(1.5, 5), ang: random(-0.6, 0.6),
+      lighter, a: random(60, 130)
+    });
+  }
+  for (let i = 0; i < 45; i++) {
+    sandGrain.push({
+      x: random(-42, 42), y: random(-4, 7),
+      w: random(4, 12), h: random(1.5, 3.5),
+      lighter: random() < 0.5, a: random(30, 70)
+    });
+  }
+  for (let i = 0; i < 30; i++) {
+    const big = random() < 0.25;
+    boatHullDabs.push({
+      x: random(-32, 26), y: random(-4, 8),
+      w: big ? random(20, 34) : random(4, 12), h: big ? random(1.5, 2.8) : random(1, 2.2),
+      ang: random(-0.2, 0.2),
+      lighter: random() < 0.5, a: random(90, 170)
+    });
+  }
+  for (let i = 0; i < 25; i++) {
+    const bigSail = random() < 0.25;
+    boatSailDabs.push({
+      x: random(-2, 26), y: random(-58, -6),
+      w: bigSail ? random(16, 26) : random(3, 9), h: bigSail ? random(1.5, 2.5) : random(1, 2),
+      ang: random(-0.6, -0.2),
+      lighter: random() < 0.6, a: random(70, 130)
+    });
+  }
+  // fixed frond vein jitter for the two known palm calls -- generated
+  // once so the veins don't flicker every frame during the sway animation
+  for (const key of ['-2_-60', '12_-56']) {
+    const fronds = [];
+    for (let f = 0; f < 5; f++) {
+      const veins = [];
+      for (let v = 0; v < 7; v++) {
+        veins.push({ dx1: random(2, 4), dy1: random(3, 5), dx2: random(2, 4), dy2: random(3, 5), a: random(90, 150) });
+      }
+      fronds.push(veins);
+    }
+    palmFrondData[key] = fronds;
+  }
+  for (let i = 0; i < 4; i++) {
+    const pts = [];
+    let cx = random(-20, 20), cy = random(-55, -10);
+    pts.push({ x: cx, y: cy });
+    for (let s = 0; s < 3; s++) {
+      cx += random(-6, 6);
+      cy += random(4, 10);
+      pts.push({ x: cx, y: cy });
+    }
+    rockCracks.push(pts);
+  }
+
+  for (let i = 0; i < 5; i++) {
+    boatReflectionJitter.push({
+      ox: random(-16, 16), rot: random(-0.08, 0.08), w: random(18, 32)
+    });
+  }
+
+  for (let i = 0; i < 150; i++) {
+    const depth = random();
+    raindrops.push({
+      x: random(W), y: random(H),
+      depth,
+      speed: lerp(7, 17, depth),
+      weight: lerp(0.5, 1.8, depth),
+      baseAlpha: lerp(60, 175, depth)
+    });
+  }
+  for (let i = 0; i < 15; i++) {
+    clouds.push({
+      x: random(W),
+      y: random(H * 0.03, HORIZON * 0.6),
+      drift: random(0.15, 0.5),
+      puffs: Array.from({ length: 6 }, () => ({
+        dx: random(-80, 80),
+        dy: random(-20, 20),
+        w: random(110, 200),
+        h: random(32, 56),
+        // fixed edge texture so the puff reads as a brushed cloud
+        // mass instead of one smooth flat ellipse
+        grain: Array.from({ length: 5 }, () => ({
+          gx: random(-0.9, 0.9), gy: random(-0.9, 0.9),
+          gw: random(0.3, 0.6), gh: random(0.3, 0.6),
+          a: random(20, 45)
+        }))
+      }))
+    });
+  }
+
+  for (let i = 0; i < 6; i++) {
+    const arr = [];
+    for (let x = 10; x <= W; x += random(45, 70)) arr.push(x);
+    swellFoamRows.push(arr);
+  }
+
+  for (let i = 0; i < SWELL_ROWS_INIT; i++) {
+    swellRowParams.push({
+      f1: random(0.013, 0.026), f2: random(0.025, 0.05), f3: random(0.05, 0.09),
+      s1: random(0.7, 1.3), s2: random(0.6, 1.5), s3: random(0.5, 1.2),
+      p1: random(TWO_PI), p2: random(TWO_PI), p3: random(TWO_PI),
+      n: random(1000), speedMul: random(0.7, 1.4),
+      // the big, slow envelope: 2-3 broad swells across the whole
+      // width. This is the actual missing layer -- sharpness was
+      // being applied per-point with no tie to any large-scale
+      // position, so there was no rhythm for the eye to follow
+      bigCycles: random(2, 3.3), bigPhase: random(TWO_PI), bigSpeedMul: random(1.0, 1.5)
+    });
+    // fixed brush-dab texture for this wave row -- painted once so it
+    // never flickers, positioned across the full canvas width; each
+    // frame the wave's actual crest shape clips this to reveal only
+    // the dabs inside it, giving real oil-pastel-like brush texture
+    // instead of a smooth flat gradient fill
+    const dabs = [];
+    for (let k = 0; k < 32; k++) {
+      const big = random() < 0.22;
+      dabs.push({
+        x: random(W * 1.1) - W * 0.05, yOff: random(-24, 26),
+        len: big ? random(38, 78) : random(7, 22),
+        wid: big ? random(3, 7) : random(2, 6),
+        ang: random(-0.3, 0.3),
+        jr: random(-32, 30), jg: random(-18, 26), jb: random(-12, 20),
+        a: random(40, 120)
+      });
+    }
+    waveRowDabs.push(dabs);
+  }
+  // irregular, sparse sample points per row -- this is what actually
+  // creates an angular/faceted silhouette. Dense uniform sampling
+  // (the old version, every 10px) always looks smooth no matter what
+  // the underlying math is, because each straight segment is tiny
+  // relative to the wave's wavelength. Fewer, IRREGULARLY spaced
+  // points connected by straight lines reads as jagged facets instead.
+  // Each point also gets a fixed, independent jag jitter (not derived
+  // from the smooth wave function). This is the actual reason the
+  // previous "sparse sampling" attempt still looked rounded: sampling
+  // fewer points on a SMOOTH continuous function still gives adjacent
+  // points similar heights (a gentle low-frequency curve is close in
+  // value 80px apart), so the polyline still traced a soft curve. A
+  // large, uncorrelated per-point jitter forces real height
+  // discontinuities between neighbors -- that's what actually reads
+  // as jagged/fractured rather than a coarsely-sampled smooth wave.
+  for (let r = 0; r < SWELL_ROWS_INIT; r++) {
+    const pts = [{ x: 0, jag: 0, sizeMul: 1 }];
+    let x = 0;
+    let prevSharp = false;
+    while (x < W) {
+      x += random(30, 85);
+      // mix round, big swells in with sharp fractures instead of
+      // every peak getting similar jag/size treatment -- ~30% of
+      // points become wide, rounder swells (low jag, boosted smooth
+      // height); the rest stay sharp fractures (full jag)
+      // ~1 sharp jagged peak for every 3-4 gentle broad swells, not
+      // sharp everywhere -- previously 30% sharp/70% gentle still
+      // read as "sharp with some variation"; flipping the ratio so
+      // sharpness is the rare accent, not the default character
+      // if the PREVIOUS point was sharp, force this one round --
+      // otherwise pure independent chance occasionally clusters 2-3
+      // sharp points next to each other by coincidence, which is
+      // exactly the "left-foreground cluster" that got flagged
+      const round = prevSharp ? random() < 0.93 : random() < 0.78;
+      prevSharp = !round;
+      pts.push({
+        x: min(x, W),
+        jag: round ? random(-0.18, 0.18) : random(-0.75, 0.75),
+        sizeMul: round ? random(1.4, 1.9) : random(0.8, 1.05)
+      });
+    }
+    if (pts[pts.length - 1].x !== W) pts.push({ x: W, jag: 0, sizeMul: 1 });
+    waveSamplePoints.push(pts);
+  }
+  for (let i = 0; i < 40; i++) {
+    turbPatches.push({ x: random(W), y0: random(1) });
+  }
+}
+
+// ---- color helpers: explicit RGB stops, never wrap through green ----
+function stopColor(stops, t) {
+  t = constrain(t, 0, 1);
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i], b = stops[i + 1];
+    if (t >= a.t && t <= b.t) {
+      const lt = (t - a.t) / (b.t - a.t);
+      return color(
+        lerp(a.c[0], b.c[0], lt),
+        lerp(a.c[1], b.c[1], lt),
+        lerp(a.c[2], b.c[2], lt)
+      );
+    }
+  }
+  const last = stops[stops.length - 1].c;
+  return color(last[0], last[1], last[2]);
+}
+function skyColorAt(y) { return stopColor(skyStops, y / HORIZON); }
+function waterColorAt(y) { return stopColor(waterStops, (y - HORIZON) / (H - HORIZON)); }
+
+// ---- one dab of paint: a rotated, jittered ellipse ----
+function dab(buf, x, y, len, wid, ang, c, a) {
+  const jr = constrain(red(c) + random(-12, 12), 0, 255);
+  const jg = constrain(green(c) + random(-12, 12), 0, 255);
+  const jb = constrain(blue(c) + random(-12, 12), 0, 255);
+  buf.push();
+  buf.translate(x, y);
+  buf.rotate(ang);
+  buf.fill(jr, jg, jb, a);
+  buf.ellipse(0, 0, len, wid);
+  buf.pop();
+}
+
+function fillGradientRect(buf, x0, y0, w, h, stops) {
+  const ctx = buf.drawingContext;
+  const grad = ctx.createLinearGradient(0, y0, 0, y0 + h);
+  for (const s of stops) {
+    grad.addColorStop(s.t, `rgb(${s.c[0]},${s.c[1]},${s.c[2]})`);
+  }
+  ctx.fillStyle = grad;
+  ctx.fillRect(x0, y0, w, h);
+}
+
+function generateBasePainting() {
+  const g = paintLayer;
+
+  // 1. solid opaque gradients first -- guarantees no transparent gaps
+  fillGradientRect(g, 0, 0, W, HORIZON, skyStops);
+  fillGradientRect(g, 0, HORIZON, W, H - HORIZON, waterStops);
+
+  // 2. sun bloom, radial glow blended in before texture
+  const ctx = g.drawingContext;
+  const glow = ctx.createRadialGradient(sunX, sunY, 4, sunX, sunY, 190);
+  glow.addColorStop(0, 'rgba(255,248,225,0.95)');
+  glow.addColorStop(0.25, 'rgba(255,214,150,0.55)');
+  glow.addColorStop(0.6, 'rgba(255,170,110,0.18)');
+  glow.addColorStop(1, 'rgba(255,170,110,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(0, 0, W, H);
+
+  // 3. tapering reflection column (soft, blurred, screen-blended)
+  reflectionGlow = createGraphics(W, H - HORIZON);
+  const rg = reflectionGlow;
+  rg.clear();
+  rg.drawingContext.filter = 'blur(10px)';
+  rg.noStroke();
+  for (let y = 0; y < rg.height; y += 4) {
+    const t = y / rg.height;
+    const spread = lerp(8, 100, t);
+    const rc = ctx.createLinearGradient ? null : null;
+    rg.fill(255, lerp(214, 150, t), lerp(150, 90, t), lerp(150, 40, t));
+    rg.rect(sunX - spread * 0.5, y, spread, 5);
+  }
+  rg.drawingContext.filter = 'none';
+  g.push();
+  g.blendMode(SCREEN);
+  g.image(rg, 0, HORIZON);
+  g.blendMode(BLEND);
+  g.pop();
+
+  // 4. sun core, crisp and bright
+  g.noStroke();
+  for (let i = 0; i < 60; i++) {
+    const r = random(30) * sqrt(random());
+    const a = random(TWO_PI);
+    g.fill(255, lerp(250, 210, r / 30), lerp(225, 130, r / 30), random(120, 220));
+    g.ellipse(sunX + cos(a) * r, sunY + sin(a) * r * 0.85, random(6, 14), random(6, 12));
+  }
+
+  // 5. sky texture dabs -- broad, overlapping strokes for a painted feel
+  for (let i = 0; i < 1100; i++) {
+    const x = random(W), y = random(0, HORIZON);
+    const c = skyColorAt(y);
+    dab(g, x, y, random(22, 46), random(6, 12), random(-0.3, 0.05), c, random(60, 120));
+  }
+
+  // 6. water texture dabs, mostly horizontal -- skip near the island,
+  // since the pale horizon-reflection color here can read as foam
+  for (let i = 0; i < 1500; i++) {
+    const x = random(W), y = random(HORIZON, H);
+    if (dist(x, y, islandX, islandY) < 90) continue;
+    const c = waterColorAt(y);
+    dab(g, x, y, random(20, 42), random(4, 9), random(-0.1, 0.1), c, random(60, 120));
+  }
+
+  // 7. glitter dabs along the reflection column
+  for (let y = HORIZON; y < H; y += 5) {
+    const t = (y - HORIZON) / (H - HORIZON);
+    const spread = lerp(8, 100, t);
+    const n = floor(lerp(2, 6, t));
+    for (let k = 0; k < n; k++) {
+      const x = sunX + random(-spread, spread) * random();
+      if (dist(x, y, islandX, islandY) < 90) continue;
+      const warm = color(255, lerp(220, 150, t), lerp(150, 80, t));
+      dab(g, x, y + random(-2, 2), random(10, 24), random(3, 6), random(-0.1, 0.1), warm, random(70, 160));
+    }
+  }
+
+  // 8. scattered foam / light-catch highlights -- skip a zone around
+  // the island so none of these land near its base and read as
+  // leftover foam there
+  for (let i = 0; i < 140; i++) {
+    const y = random(HORIZON + 15, H);
+    const x = random(W);
+    if (dist(x, y, islandX, islandY) < 90) continue;
+    dab(g, x, y, random(6, 14), random(2, 4), random(-0.2, 0.2), color(235, 240, 245), random(60, 130));
+  }
+
+  // 9. vignette for drama and focus
+  g.push();
+  g.blendMode(MULTIPLY);
+  const vg = g.drawingContext.createRadialGradient(W * 0.5, H * 0.5, H * 0.32, W * 0.5, H * 0.5, H * 0.95);
+  vg.addColorStop(0, 'rgba(255,255,255,1)');
+  vg.addColorStop(1, 'rgba(140,132,150,1)');
+  g.drawingContext.fillStyle = vg;
+  g.drawingContext.fillRect(0, 0, W, H);
+  g.pop();
+}
+
+// boat drawn fresh every frame directly on the main canvas (not baked
+// into paintLayer) so it can move without leaving trails
+function drawBoatDynamic() {
+  // idle bob when calm, blended into the ACTUAL wave height under the
+  // hull once a storm is running, so the boat rides the real surface
+  // instead of animating on its own independent sine wave
+  const idleBob = sin(frameCount * 0.05) * 3 * boatScale;
+  const depthT = constrain((boatY - HORIZON) / (H - HORIZON), 0, 1);
+  const waveH = waveHeightAt(boatX, depthT) * boatScale;
+  const bob = idleBob + waveH;
+
+  // tilt follows the local wave slope (compare height just ahead and
+  // behind the hull) instead of an unrelated random-looking sway
+  const slope = (waveHeightAt(boatX + 10, depthT) - waveHeightAt(boatX - 10, depthT)) * 0.03;
+  const tossTilt = slope + sin(frameCount * 0.08) * stormLevel * 0.12;
+
+  const by = boatY + bob;
+  const bx = boatX;
+
+  push();
+  translate(bx, by);
+  scale(boatScale);
+  rotate(tossTilt);
+  noStroke();
+
+  const ctx = drawingContext;
+
+  // hull -- gradient from a lit rim to a dark waterline shadow instead
+  // of one flat silhouette color
+  const hullGrad = ctx.createLinearGradient(0, -5, 0, 9);
+  hullGrad.addColorStop(0, 'rgb(58,50,46)');
+  hullGrad.addColorStop(0.4, 'rgb(24,20,20)');
+  hullGrad.addColorStop(1, 'rgb(8,7,9)');
+  ctx.fillStyle = hullGrad;
+  // slight organic irregularity in the outline instead of two perfectly
+  // smooth bezier curves -- small, since it's still a man-made hull,
+  // but enough that it doesn't read as a flawless vector shape
+  ctx.beginPath();
+  ctx.moveTo(-34, 0);
+  ctx.bezierCurveTo(-30, 9, -3, 9.6, 11, 8.4);
+  ctx.lineTo(19, 8.7);
+  ctx.bezierCurveTo(24, 7.6, 27, 3, 28, 0);
+  ctx.bezierCurveTo(20, -4.6, 3, -5.6, -11, -4.9);
+  ctx.lineTo(-23, -4.5);
+  ctx.bezierCurveTo(-29, -3.8, -32, -2, -34, 0);
+  ctx.closePath();
+  ctx.fill();
+
+  // wood-grain brush texture, clipped to the hull shape just filled
+  ctx.save();
+  ctx.clip();
+  noStroke();
+  for (const d of boatHullDabs) {
+    push();
+    translate(d.x, d.y);
+    rotate(d.ang);
+    fill(d.lighter ? 150 : 2, d.lighter ? 122 : 2, d.lighter ? 98 : 3, d.a);
+    ellipse(0, 0, d.w, d.h);
+    pop();
+  }
+  ctx.restore();
+
+  // fixed plank lines along the hull -- static geometry, never
+  // re-randomized, so there's no flicker
+  stroke(0, 0, 0, 90);
+  strokeWeight(0.6);
+  noFill();
+  beginShape(); vertex(-30, 3); bezierVertex(-10, 7, 14, 7, 26, 2); endShape();
+  beginShape(); vertex(-26, 1); bezierVertex(-6, 4.5, 18, 4.5, 27, 1); endShape();
+  noStroke();
+
+  // gunwale rim light along the top edge of the hull
+  stroke(210, 200, 190, 110);
+  strokeWeight(1);
+  noFill();
+  beginShape();
+  vertex(-33, -4);
+  bezierVertex(-20, -5.5, 10, -5.5, 27, -4.5);
+  endShape();
+  noStroke();
+
+  // small waterline highlight where the hull meets the sea
+  stroke(200, 210, 220, 70);
+  strokeWeight(1);
+  line(-32, 1.5, 26, 1.5);
+  noStroke();
+
+  // bow spray, kicking up harder as the storm builds
+  if (stormLevel > 0.15) {
+    for (let i = 0; i < 5; i++) {
+      fill(240, 246, 248, random(90, 170) * stormLevel);
+      ellipse(-33 + random(-6, 2), random(-6, 2) - stormLevel * 4, random(2, 5) * stormLevel + 1, random(2, 5) * stormLevel + 1);
+    }
+  }
+
+  // mast, subtly shaded round instead of a flat rectangle
+  const mastGrad = ctx.createLinearGradient(-1, 0, 1, 0);
+  mastGrad.addColorStop(0, 'rgb(50,42,36)');
+  mastGrad.addColorStop(0.5, 'rgb(20,17,16)');
+  mastGrad.addColorStop(1, 'rgb(8,7,7)');
+  ctx.fillStyle = mastGrad;
+  ctx.fillRect(-1.2, -66, 2.4, 66);
+
+  // sail -- gradient cloth shading plus a couple of fixed fold lines,
+  // instead of two flat-color triangles
+  const luff = stormLevel * 6;
+  const sailGrad = ctx.createLinearGradient(-2, -4, 30 - luff, -50);
+  sailGrad.addColorStop(0, 'rgb(198,198,202)');
+  sailGrad.addColorStop(0.5, 'rgb(250,248,244)');
+  sailGrad.addColorStop(1, 'rgb(226,224,222)');
+  ctx.fillStyle = sailGrad;
+  // a very slight outward billow on the leading edge instead of a
+  // perfectly straight line, like real cloth catching wind
+  ctx.beginPath();
+  ctx.moveTo(0, -4);
+  ctx.quadraticCurveTo(3.5 + luff * 0.2, -34, luff * 0.4, -62);
+  ctx.lineTo(30 - luff, -6);
+  ctx.closePath();
+  ctx.fill();
+
+  // fabric brush texture, clipped to the main sail panel just filled
+  ctx.save();
+  ctx.clip();
+  noStroke();
+  for (const d of boatSailDabs) {
+    push();
+    translate(d.x, d.y);
+    rotate(d.ang);
+    fill(d.lighter ? 255 : 150, d.lighter ? 255 : 158, d.lighter ? 252 : 170, d.a);
+    ellipse(0, 0, d.w, d.h);
+    pop();
+  }
+  ctx.restore();
+
+  // shadowed leeward panel, still gradient rather than one flat tone
+  const shadeGrad = ctx.createLinearGradient(-4, -4, luff * 0.4, -62);
+  shadeGrad.addColorStop(0, 'rgb(170,172,178)');
+  shadeGrad.addColorStop(1, 'rgb(214,214,218)');
+  ctx.fillStyle = shadeGrad;
+  ctx.beginPath();
+  ctx.moveTo(0, -4);
+  ctx.lineTo(luff * 0.4, -62);
+  ctx.lineTo(-4, -6);
+  ctx.closePath();
+  ctx.fill();
+
+  // fold lines in the cloth -- pulled well inside the sail's actual
+  // triangle edge (they were previously placed past it, poking out
+  // as stray lines beyond the white cloth)
+  stroke(255, 255, 255, 70);
+  strokeWeight(0.8);
+  noFill();
+  beginShape(); vertex(2, -10); bezierVertex(5, -20, 7, -32, 8, -44); endShape();
+  beginShape(); vertex(4, -8); bezierVertex(7, -16, 9, -26, 10, -36); endShape();
+  stroke(90, 90, 95, 70);
+  beginShape(); vertex(-1, -12); bezierVertex(1, -24, 2, -36, 2, -48); endShape();
+  noStroke();
+
+  if (humanOnBoat) {
+    drawHuman(-10, -5, 0.55, 0);
+  }
+  pop();
+
+  // reflection, tracks the boat's actual position, drawn straight to
+  // the main canvas each frame -- jitter is fixed from setup (only
+  // the boat's own position/scale changes), so it doesn't flicker
+  noStroke();
+  for (let i = 0; i < 5; i++) {
+    const j = boatReflectionJitter[i];
+    push();
+    translate(bx + j.ox * boatScale, by + (7 + i * 6) * boatScale);
+    rotate(j.rot);
+    fill(12, 12, 18, 90 - i * 14);
+    ellipse(0, 0, j.w * boatScale, 4 * boatScale);
+    pop();
+  }
+}
+
+// ---- island with its passenger ----
+function drawIsland() {
+  push();
+  translate(islandX, islandY);
+  noStroke();
+
+  // soft shadow cast on the water
+  push();
+  blendMode(MULTIPLY);
+  noStroke();
+  fill(150, 155, 165, 35);
+  ellipse(2, 10, 108, 14);
+  pop();
+
+  // a few dark rocks at the waterline, ahead of the main rock mass
+  fill(38, 36, 38, 235);
+  ellipse(-46, 6, 13, 7);
+  ellipse(42, 8, 10, 6);
+  ellipse(50, 4, 7, 5);
+
+  // narrow sand strip at the base -- gradient, warm where the sun
+  // catches it, cooling toward the shaded side
+  const ctx = drawingContext;
+  const sandGrad = ctx.createLinearGradient(-40, 0, 40, 0);
+  sandGrad.addColorStop(0, 'rgb(150,132,102)');
+  sandGrad.addColorStop(0.45, 'rgb(200,176,132)');
+  sandGrad.addColorStop(1, 'rgb(170,148,112)');
+  ctx.fillStyle = sandGrad;
+  ctx.beginPath();
+  ctx.moveTo(-40, 5);
+  ctx.bezierCurveTo(-32, 0, -10, -2, 4, -2);
+  ctx.bezierCurveTo(18, -2, 34, 1, 40, 5);
+  ctx.bezierCurveTo(18, 8, -18, 8, -40, 5);
+  ctx.closePath();
+  ctx.fill();
+
+  // grainy brush texture on the sand, clipped to the shape just filled
+  ctx.save();
+  ctx.clip();
+  noStroke();
+  for (const s of sandGrain) {
+    fill(s.lighter ? 225 : 130, s.lighter ? 200 : 108, s.lighter ? 155 : 82, s.a);
+    ellipse(s.x, s.y, s.w, s.h);
+  }
+  ctx.restore();
+
+  // tall rocky mass -- gradient from lit warm-grey (sun side, left)
+  // to cool shadow (right), instead of one flat color
+  const rockGrad = ctx.createLinearGradient(-30, -40, 26, -20);
+  rockGrad.addColorStop(0, 'rgb(158,124,92)');
+  rockGrad.addColorStop(0.45, 'rgb(112,86,66)');
+  rockGrad.addColorStop(1, 'rgb(64,48,40)');
+  ctx.fillStyle = rockGrad;
+  // angular, jagged silhouette instead of smooth bezier curves -- this
+  // is the actual fix per the critique: no amount of surface texture
+  // corrects a fundamentally smooth/rounded outline. Straight-line
+  // segments between irregular points read as broken rock, not a
+  // rounded blob.
+  ctx.beginPath();
+  ctx.moveTo(-34, -2);
+  ctx.lineTo(-36, -18);
+  ctx.lineTo(-26, -26);
+  ctx.lineTo(-31, -38);
+  ctx.lineTo(-19, -45);
+  ctx.lineTo(-23, -55);
+  ctx.lineTo(-9, -61);
+  ctx.lineTo(-2, -67);
+  ctx.lineTo(7, -62);
+  ctx.lineTo(3, -53);
+  ctx.lineTo(15, -55);
+  ctx.lineTo(11, -45);
+  ctx.lineTo(23, -41);
+  ctx.lineTo(19, -29);
+  ctx.lineTo(29, -21);
+  ctx.lineTo(25, -11);
+  ctx.lineTo(30, -3);
+  ctx.lineTo(26, -1);
+  ctx.lineTo(6, -9);
+  ctx.lineTo(-16, -9);
+  ctx.closePath();
+  ctx.fill();
+
+  // rock facet texture: irregular darker and lighter patches to break
+  // up the flat gradient into believable stone surface -- fixed
+  // positions from setup, not re-randomized every frame
+  push();
+  drawingContext.save();
+  drawingContext.clip(new Path2D(
+    'M -34 -2 L -36 -18 L -26 -26 L -31 -38 L -19 -45 L -23 -55 ' +
+    'L -9 -61 L -2 -67 L 7 -62 L 3 -53 L 15 -55 L 11 -45 L 23 -41 ' +
+    'L 19 -29 L 29 -21 L 25 -11 L 30 -3 L 26 -1 L 6 -9 L -16 -9 Z'
+  ));
+  noStroke();
+  for (const f of rockFacets) {
+    push();
+    translate(f.x, f.y);
+    rotate(f.ang);
+    fill(f.lighter ? 205 : 30, f.lighter ? 172 : 22, f.lighter ? 130 : 20, f.a);
+    ellipse(0, 0, f.w, f.h);
+    pop();
+  }
+  stroke(46, 32, 24, 130);
+  strokeWeight(0.8);
+  noFill();
+  for (const pts of rockCracks) {
+    beginShape();
+    for (const p of pts) vertex(p.x, p.y);
+    endShape();
+  }
+  noStroke();
+  drawingContext.restore();
+  pop();
+
+  // moonlit / sunlit rim catching the horizon glow on the left edge --
+  // traces the new jagged silhouette with straight segments
+  stroke(230, 210, 195, 130);
+  strokeWeight(1.6);
+  noFill();
+  beginShape();
+  vertex(-34, -6);
+  vertex(-36, -18);
+  vertex(-26, -26);
+  vertex(-31, -38);
+  vertex(-19, -45);
+  vertex(-23, -55);
+  vertex(-9, -61);
+  vertex(-2, -64);
+  endShape();
+  noStroke();
+
+  // patch of vegetation clinging near the top, with a little shading
+  fill(38, 58, 34, 220);
+  ellipse(3, -55, 20, 12);
+  fill(58, 82, 48, 200);
+  ellipse(-2, -58, 12, 7);
+
+  // two palms perched on the summit
+  drawPalm(-2, -60, 0.85);
+  drawPalm(12, -56, 0.7);
+
+  // (no surf/foam effect on the island -- removed per request)
+
+  pop();
+
+  if (!humanOnBoat) {
+    drawHuman(islandX - 10, islandY - 3, 1.5, sin(frameCount * 0.03) * 0.04);
+  }
+}
+
+
+function drawPalm(x, y, scl) {
+  const key = x + '_' + y;
+  const frondData = palmFrondData[key];
+  const sway = sin(frameCount * 0.045 + x * 0.15) * stormLevel * 0.22
+             + sin(frameCount * 0.02) * 0.02;
+  push();
+  translate(x, y);
+  rotate(sway);
+  scale(scl);
+
+  // trunk with a lit side and a shadow side, plus bark ring texture
+  stroke(72, 54, 38, 240);
+  strokeWeight(3.2);
+  noFill();
+  beginShape();
+  vertex(-0.6, 0);
+  bezierVertex(-2.6, -12, 1.4, -22, -0.6, -34);
+  endShape();
+  stroke(30, 22, 16, 200);
+  strokeWeight(1.2);
+  beginShape();
+  vertex(1.4, 0);
+  bezierVertex(-0.6, -12, 3.4, -22, 1.4, -34);
+  endShape();
+  strokeWeight(1);
+  stroke(30, 22, 16, 130);
+  for (let i = 0; i < 6; i++) {
+    const t = i / 5;
+    const tx = lerp(0, 1, t) * -1.6 + sin(t * 8) * 1.5;
+    const ty = lerp(0, -34, t);
+    line(tx - 2.5, ty, tx + 2.5, ty + 1.5);
+  }
+  noStroke();
+
+  // fronds, five blades fanning from the crown, each shaded from a
+  // darker base to a lighter tip instead of one flat green
+  const crownX = 1, crownY = -34;
+  for (let i = 0; i < 5; i++) {
+    const a = map(i, 0, 4, -2.3, -0.6);
+    push();
+    translate(crownX, crownY);
+    rotate(a);
+    const frondGrad = drawingContext.createLinearGradient(0, 0, 26, 0);
+    frondGrad.addColorStop(0, 'rgb(34,58,30)');
+    frondGrad.addColorStop(1, 'rgb(70,108,56)');
+    drawingContext.fillStyle = frondGrad;
+    drawingContext.beginPath();
+    drawingContext.moveTo(0, 0);
+    drawingContext.bezierCurveTo(6, -3, 20, -2, 26, 3);
+    drawingContext.bezierCurveTo(16, 2, 6, 3, 0, 0);
+    drawingContext.closePath();
+    drawingContext.fill();
+    // multiple veins + jagged serration strokes -- a smooth single
+    // outline reads as a flat clip-art leaf shape; real fronds have
+    // visible individual leaflets raking off the central vein.
+    // Vein jitter is precomputed (frondData) so it never flickers.
+    stroke(28, 46, 24, 140);
+    strokeWeight(0.7);
+    line(1, 0, 25, 2);
+    const veins = frondData ? frondData[i] : null;
+    for (let v = 0; v < 7; v++) {
+      const vt = v / 6;
+      const vx = lerp(2, 24, vt), vy = lerp(0.5, 2.5, vt);
+      const vd = veins ? veins[v] : { dx1: 3, dy1: 4, dx2: 3, dy2: 4, a: 120 };
+      stroke(vt < 0.5 ? 90 : 26, vt < 0.5 ? 130 : 40, vt < 0.5 ? 70 : 22, vd.a);
+      strokeWeight(0.6);
+      line(vx, vy, vx + vd.dx1, vy - vd.dy1);
+      line(vx, vy, vx + vd.dx2, vy + vd.dy2);
+    }
+    noStroke();
+    pop();
+  }
+  pop();
+}
+
+// minimal silhouette figure; (x,y) is where the feet stand
+function drawHuman(x, y, scl, tilt) {
+  push();
+  translate(x, y);
+  scale(scl);
+  rotate(tilt || 0);
+
+  // stronger contact shadow for grounding
+  noStroke();
+  fill(0, 0, 0, 70);
+  ellipse(0, 0.5, 13, 4);
+
+  // legs, thin rounded strokes instead of blocky rectangles
+  strokeCap(ROUND);
+  stroke(15, 13, 16, 250);
+  strokeWeight(2.4);
+  line(-2, -10, -3, 0);
+  line(2, -10, 3, 0);
+
+  // torso, one smooth tapered shape
+  noStroke();
+  fill(15, 13, 16, 250);
+  beginShape();
+  vertex(-3.5, -10);
+  bezierVertex(-4.5, -16, -3, -22, 0, -24);
+  bezierVertex(3, -22, 4.5, -16, 3.5, -10);
+  bezierVertex(1.5, -9, -1.5, -9, -3.5, -10);
+  endShape(CLOSE);
+
+  // head
+  ellipse(0, -27, 6.5, 6.5);
+
+  // a raised arm, thin and rounded
+  stroke(20, 18, 22, 245);
+  strokeWeight(1.5);
+  line(2.5, -21, 7, -25);
+  noStroke();
+  pop();
+}
+
+function updateIslandProximity() {
+  const dx = abs(boatX - islandX);
+  const near = dx < 55 && boatScale < 0.85;
+  if (near && !nearIslandPrev) {
+    humanOnBoat = !humanOnBoat;
+  }
+  nearIslandPrev = near;
+}
+
+function draw() {
+  image(paintLayer, 0, 0);
+
+  updateStorm();
+  updateBoatPosition();
+  updateIslandProximity();
+
+  drawIsland();
+  drawStormOverlay();
+  drawWake();
+  drawBoatDynamic();
+
+  if (lightningFlash > 0) {
+    push();
+    noStroke();
+    fill(255, 255, 255, lightningFlash);
+    rect(0, 0, W, H);
+    pop();
+    lightningFlash -= 20;
+  }
+}
+
+function updateBoatPosition() {
+  if (mouseX > 4 && mouseX < W - 4 && mouseY > 4 && mouseY < H - 4) {
+    boatTargetX = constrain(mouseX, W * 0.1, W * 0.9);
+    boatTargetY = constrain(mouseY, HORIZON - 8, H * 0.84);
+  }
+  boatX += (boatTargetX - boatX) * 0.025;
+  boatY += (boatTargetY - boatY) * 0.04;
+  const targetScale = map(boatY, HORIZON - 8, H * 0.84, 0.55, 1.6, true);
+  boatScale += (targetScale - boatScale) * 0.06;
+}
+
+function drawWake() {
+  noStroke();
+  const depthT = constrain((boatY - HORIZON) / (H - HORIZON), 0, 1);
+  const by = boatY + sin(frameCount * 0.05) * 3 * boatScale + waveHeightAt(boatX, depthT) * boatScale;
+  for (let i = 0; i < 6; i++) {
+    const t = i / 5;
+    fill(230, 235, 240, lerp(70, 0, t) * (1 - stormLevel * 0.3));
+    ellipse(boatX - (40 + i * 14) * boatScale, by + (6 + i * 1.5) * boatScale, (20 - i * 2) * boatScale, 4 * boatScale);
+  }
+}
+
+function updateStorm() {
+  stormLevel += (stormTarget - stormLevel) * (stormTarget > stormLevel ? 0.045 : 0.05);
+  if (stormLevel > 0.6 && random() < 0.014 * stormLevel) {
+    lightningFlash = 170;
+    lightningBolt = generateBolt();
+  }
+}
+
+function generateBolt() {
+  const pts = [];
+  let x = random(W * 0.25, W * 0.75);
+  let y = 0;
+  pts.push({ x, y });
+  while (y < HORIZON - 10) {
+    x += random(-32, 32);
+    y += random(22, 42);
+    pts.push({ x, y });
+  }
+  return pts;
+}
+
+function drawLightningBolt() {
+  if (!lightningBolt) return;
+  const a = constrain(map(lightningFlash, 0, 170, 0, 255), 0, 255);
+  push();
+  noFill();
+  stroke(230, 235, 255, a * 0.35);
+  strokeWeight(6);
+  beginShape();
+  for (const p of lightningBolt) vertex(p.x, p.y);
+  endShape();
+  stroke(255, 255, 255, a);
+  strokeWeight(2);
+  beginShape();
+  for (const p of lightningBolt) vertex(p.x, p.y);
+  endShape();
+  pop();
+}
+
+// layered sine + noise, with each row's own randomized frequency and
+// phase (not derived from its index) so rows don't move in lockstep
+function waveShape(x, speed, amp, row) {
+  // one dominant, long, low-frequency swell (1-2 cycles across the
+  // whole width) plus a much smaller secondary ripple and mild noise
+  // -- the old version summed 3 harmonics at higher frequencies and
+  // sharpened the peaks, which packed many small cycles across the
+  // width and read as a repeating chain of separate rounded humps
+  // instead of a few large rolling swells
+  let w = sin(x * row.f1 + speed * row.s1 + row.p1) * 0.75
+        + sin(x * row.f1 * 2.1 + speed * row.s2 * 1.3 + row.p2) * 0.18;
+  w += (noise(x * 0.012 + row.n, speed * 0.05) - 0.5) * 0.35;
+  return w * amp;
+}
+
+const SWELL_ROWS = 8;
+
+// gives the actual current wave-surface height at any x/depth, using
+// the SAME math as drawSwells -- lets other things (the boat) sync to
+// the real wave shapes instead of animating independently of them
+function waveHeightAt(x, depthT) {
+  if (stormLevel < 0.01) return 0;
+  // rows are spaced quadratically in drawSwells (y = HORIZON + t*t*range),
+  // so recovering the row index from a physical depth fraction needs
+  // the inverse (sqrt), not a direct linear lookup -- that mismatch
+  // was what desynced the boat from the actual wave positions
+  const rowT = Math.sqrt(constrain(depthT, 0, 1));
+  const i = constrain(Math.round(rowT * (SWELL_ROWS - 1)), 0, SWELL_ROWS - 1);
+  const row = swellRowParams[i];
+  const t = i / (SWELL_ROWS - 1);
+  const amp = (5 + t * 30) * stormLevel;
+  const speed = frameCount * (0.045 + stormLevel * 0.1) * row.speedMul;
+  // uses the shared helper so this stays in sync with the fill shape
+  return bigSwellHeight(x, speed, amp, row);
+}
+
+function drawSwells() {
+  const rows = SWELL_ROWS;
+  const ctx = drawingContext;
+  for (let i = 0; i < rows; i++) {
+    const row = swellRowParams[i];
+    const t = i / (rows - 1);
+    const y = HORIZON + t * t * (H - HORIZON);
+    const amp = (5 + t * 30) * stormLevel;
+    if (amp < 1) continue;
+    const speed = frameCount * (0.045 + stormLevel * 0.1) * row.speedMul;
+
+    noStroke();
+    // sparse, IRREGULARLY spaced points connected by straight lines --
+    // this is what actually produces an angular/faceted silhouette.
+    // The old version sampled every 10px, which always looks smooth
+    // no matter what the underlying math is, because each straight
+    // segment is tiny relative to the wave's wavelength
+    const pts = waveSamplePoints[i % waveSamplePoints.length];
+    // height = smooth wave component + a LARGE independent jag term.
+    // The jag term is what actually forces sharp height jumps between
+    // neighboring points -- amp alone (the smooth part) was never
+    // going to look angular since it varies gently between nearby x
+    // jag gets its own scaling, independent of `amp`'s falloff near
+    // the horizon -- previously jag was amp*1.1, and amp shrinks a
+    // lot near the horizon (5x smaller than the foreground), so
+    // distant rows were accidentally getting almost no jag at all.
+    // That read as "smooth in back, jagged in front" by accident, not
+    // as a deliberate depth choice.
+    // real two-layer structure: a slow big-swell envelope IS the
+    // primary shape (2-3 broad rises/falls across the width), and
+    // sharp jag texture is explicitly gated by `crest` -- it only
+    // activates near the envelope's own peaks and is suppressed
+    // toward zero in the troughs, which is what gives the eye an
+    // actual rhythm to follow instead of uniform noise everywhere
+    const bigFreq = (row.bigCycles * TWO_PI) / W;
+    const bigSpeed = speed * row.bigSpeedMul;
+    const jagAmp = (9 + t * 15) * stormLevel;
+    const heights = pts.map(p => {
+      const upness = sin(p.x * bigFreq + row.bigPhase + bigSpeed); // -1..1
+      const crest = Math.pow(Math.max(0, upness), 2.1); // 0 in troughs, 1 at peak
+      const bigShape = -upness * amp * 0.95;
+      const sharpDetail = p.jag * jagAmp * crest * p.sizeMul;
+      return bigShape + sharpDetail;
+    });
+    let minH = 0;
+    for (const h of heights) if (h < minH) minH = h;
+
+    const skirt = amp * 1.15;
+    const bandGrad = ctx.createLinearGradient(0, y + minH, 0, y + skirt);
+    bandGrad.addColorStop(0, `rgba(84,150,172,${0.85 * stormLevel})`);
+    bandGrad.addColorStop(0.45, `rgba(24,72,84,${0.75 * stormLevel})`);
+    bandGrad.addColorStop(1, `rgba(6,16,26,0)`);
+    ctx.fillStyle = bandGrad;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, y + skirt);
+    for (let k = 0; k < pts.length; k++) ctx.lineTo(pts[k].x, y + heights[k]);
+    ctx.lineTo(pts[pts.length - 1].x, y + skirt);
+    ctx.closePath();
+    ctx.fill();
+
+    // brush-dab texture, clipped to the jagged shape just filled.
+    // Redesigned for real variance instead of a uniform stamp pattern:
+    // each dab's ANGLE follows the actual local slope of the water at
+    // its position (so strokes visibly follow the water's movement,
+    // not a fixed jitter), size varies wildly (short flecks next to
+    // long sweeping strokes), and color jitter is much wider so some
+    // strokes read as shadow and others as near-white highlight --
+    // real broken color, not a narrow uniform tint
+    ctx.save();
+    ctx.clip();
+    noStroke();
+    for (const d of waveRowDabs[i % waveRowDabs.length]) {
+      const hL = bigSwellHeight(d.x - 9, speed, amp, row);
+      const hR = bigSwellHeight(d.x + 9, speed, amp, row);
+      const localH = bigSwellHeight(d.x, speed, amp, row);
+      const slopeAng = Math.atan2(hR - hL, 18);
+      push();
+      translate(d.x, y + localH + d.yOff * 0.3);
+      rotate(slopeAng + d.ang * 0.4);
+      const shadowTone = d.jr < -6; // some strokes go dark/shadow, not just tinted teal
+      if (shadowTone) {
+        fill(8, 20, 28, (d.a + 30) * stormLevel);
+      } else {
+        // blue is structurally forced to stay >= green here, so the
+        // jitter can never accidentally produce true green -- that
+        // was the actual bug: the old base color had green slightly
+        // above blue already, and positive green jitter pushed it
+        // further, producing a visible green tint instead of teal
+        const bl = constrain(150 + d.jb * 1.7, 90, 255);
+        const gr = constrain(bl - 22 - Math.max(0, -d.jg) * 0.5, 55, bl - 6);
+        const rd = constrain(65 + d.jr * 1.3, 0, 130);
+        fill(rd, gr, bl, (d.a + 30) * stormLevel);
+      }
+      ellipse(0, 0, d.len, d.wid);
+      pop();
+    }
+    ctx.restore();
+
+    // foam ONLY at the actual jagged peaks of the polyline itself --
+    // fewer, bolder, more size-varied strokes instead of a dense
+    // cluster of similar-sized marks (which read as a stamp texture)
+    noStroke();
+    for (let xi = 1; xi < heights.length - 1; xi++) {
+      const hgt = heights[xi];
+      const isPeak = hgt < heights[xi - 1] && hgt <= heights[xi + 1];
+      if (isPeak && hgt < -amp * 0.3) {
+        const x = pts[xi].x;
+        const wy = y + hgt;
+        const crestT = constrain(map(hgt, -amp * 0.3, -amp, 0, 1), 0, 1);
+        const strokeCount = 2 + Math.floor(crestT * 3);
+        for (let k = 0; k < strokeCount; k++) {
+          const big = random() < 0.3;
+          push();
+          translate(x + random(-16, 16), wy + random(-4, 5));
+          rotate(random(-0.7, 0.7));
+          const dark = random() < 0.3;
+          fill(dark ? 16 : 238, dark ? 26 : 242, dark ? 36 : 246,
+               (dark ? 100 : (70 + crestT * 140)) * stormLevel);
+          ellipse(0, 0, big ? random(22, 42) : random(4, 11), big ? random(1.6, 3) : random(1, 2));
+          pop();
+        }
+      }
+    }
+  }
+
+  // turbulence layer: irregular streaky patches scattered across the
+  // WHOLE water surface, ignoring the row structure entirely -- this
+  // is what actually breaks the "banded/planned" look
+  noStroke();
+  for (let i = 0; i < 26 * stormLevel; i++) {
+    const p = turbPatches[i % turbPatches.length];
+    const x = p.x;
+    const y = HORIZON + p.y0 * (H - HORIZON);
+    const n = noise(x * 0.02, y * 0.02, frameCount * 0.01);
+    const dark = n > 0.55;
+    push();
+    translate(x, y);
+    rotate(sin(frameCount * 0.02 + p.y0 * 10) * 0.15);
+    fill(dark ? 4 : 215, dark ? 9 : 220, dark ? 16 : 228, (dark ? 55 : 42) * stormLevel);
+    ellipse(0, 0, random(24, 46), random(3, 6));
+    pop();
+  }
+}
+
+function drawStormOverlay() {
+  if (stormLevel < 0.01) return;
+
+  // darken and cool the whole scene
+  push();
+  blendMode(MULTIPLY);
+  noStroke();
+  fill(90, 95, 110, 235 * stormLevel);
+  rect(0, 0, W, H);
+  pop();
+
+  // rolling clouds: soft multi-puff clusters, densely covering the sky
+  push();
+  blendMode(MULTIPLY);
+  noStroke();
+  for (const cl of clouds) {
+    cl.x -= cl.drift * (0.4 + stormLevel);
+    if (cl.x < -160) cl.x = W + 160;
+    for (const p of cl.puffs) {
+      fill(36, 34, 48, 68 * stormLevel);
+      ellipse(cl.x + p.dx, cl.y + p.dy, p.w, p.h);
+      for (const g of p.grain) {
+        fill(50, 46, 62, g.a * stormLevel);
+        ellipse(cl.x + p.dx + g.gx * p.w * 0.5, cl.y + p.dy + g.gy * p.h * 0.5, p.w * g.gw, p.h * g.gh);
+      }
+    }
+  }
+  pop();
+
+  drawSwells();
+  // (hero wave removed -- its curl geometry kept reading as a stray
+  // pale blob no matter how it was scaled)
+
+  if (lightningBolt && lightningFlash > 0) drawLightningBolt();
+
+  // (independently-random whitecap scatter removed -- it duplicated
+  // and cluttered against drawSwells' own crest foam below)
+  noStroke();
+
+  // rain -- depth-based size/speed/brightness for parallax, a soft
+  // fading tail instead of one flat line, and a lighter blend so it
+  // reads as wet streaks catching light rather than grey scratches
+  push();
+  blendMode(SCREEN);
+  noFill();
+  const fallMul = 0.5 + stormLevel * 1.15;
+  const windRatio = 0.62; // must match the tilt used in the streak below
+  for (const d of raindrops) {
+    const v = d.speed * fallMul;
+    d.y += v;
+    d.x -= v * windRatio;
+    if (d.x < -40) d.x += W + 80; // wrap horizontally, keep falling
+    if (d.y > H + 20) { d.y = -20; d.x = random(0, W); } // respawn, full width
+    const len = v * 1.3;
+    const segs = 4;
+    for (let s = 0; s < segs; s++) {
+      const t0 = s / segs, t1 = (s + 1) / segs;
+      const a = lerp(0, d.baseAlpha, t1) * stormLevel;
+      stroke(200, 210, 225, a);
+      strokeWeight(d.weight);
+      line(d.x - len * windRatio * t0, d.y + len * t0, d.x - len * windRatio * t1, d.y + len * t1);
+    }
+  }
+  pop();
+  noStroke();
+}
+
+function mousePressed() { stormTarget = 1; }
+function mouseReleased() { stormTarget = 0; }
+function touchStarted() { stormTarget = 1; }
+function touchEnded() { stormTarget = 0; }
+</script>
+</body>
+</html>
